@@ -12,7 +12,7 @@
 - Tool:
   工具包, 负责为Nono提供一些能力，只单纯的提供某一个工具并做好, 目前提供 bash、update_soul 与 workflow（列出/加载）工具，后续的工具包视情况添加。
 - Workflow: 
-  工作流，当前运行目录的 `.workflows/<名称>/` 即一个工作流，目录内的 md 文件按文件名顺序拼接构成完整说明，由它们内部构成工作流以方便用户间快速的完成某个任务的传递。
+  工作流，当前运行目录的 `.workflows/<名称>/` 即一个工作流。其中 `workflow.md` 是说明书，加载时注入上下文；`scripts/` 存放该工作流的工具脚本（stdlib 优先、非交互、参数走命令行），不注入上下文，由模型经 bash 工具按需调用。由它们内部构成工作流以方便用户间快速的完成某个任务的传递。
 - ContextManager:
   用来管理上下文的构成和从磁盘加载历史记录，为Nono的重要组成部分，由他来负责Nono每次的回话管理和人格维护等功能。
 
@@ -32,3 +32,4 @@ Nono 集成工具：update_soul 与 workflow 工具挂载为 Nono 的方法；�
 新增 `/tools` 命令：列出当前可用的工具，工具清单由 `src/tools/` 的 `TOOLS` 注册表统一维护。
 新增 bash 工具与 `/bash <命令>` 命令：只读命令（ls/cat/grep/git status 等白名单）直接放行，含重定向、命令替换、sudo 或白名单外命令的一律先询问许可；分类是保守的朴素解析，宁可多问。该工具依赖 PATH 上的 bash（Windows 下用 Git Bash），Windows 平台暂未覆盖其测试。
 Nono 支持工具调用循环：模型现在可以在回复中通过 function calling 调用 bash 工具（流式），写命令仍会先询问用户，工具结果写回上下文后继续对话，最多 8 轮；CLI 会展示每次工具调用及结果预览。至此"对工具的迭代调用"落地。
+新增首个工作流 `duanju`（AI 短剧创作），并确立工作流目录结构：`workflow.md` 为注入上下文的说明书（立项→剧本→角色设定→分镜→合成提示词→生成→ffmpeg 拼接），`scripts/` 为模型经 bash 调用的工具脚本（`init_project.py` 脚手架、`make_prompts.py` 角色设定+分镜合成逐镜头提示词、`concat.sh` 片段拼接）。
