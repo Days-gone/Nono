@@ -1,3 +1,5 @@
+"""Session context: jsonl history on disk, message assembly, and soul.md upkeep."""
+
 from __future__ import annotations
 
 import json
@@ -75,17 +77,26 @@ class ContextManager:
         files = sorted(self.history_dir.glob("*.jsonl"), reverse=True)
         return [SessionInfo(name=path.stem, path=path) for path in files]
 
-    def add_message(self, role: str, content: str) -> dict[str, Any]:
-        message = {"role": role, "content": content}
-        self._messages.append(message)
+    def add_message(self, role: str, content: str, **extra: Any) -> dict[str, Any]:
+        """Append a message to history and the session file.
+
+        Extra keys (``tool_calls``, ``tool_call_id``) are stored alongside.
+        """
         if self.session_path is None:
+            # create() resets the message list, so it has to come first.
             self.create()
+        message = {"role": role, "content": content, **extra}
+        self._messages.append(message)
         assert self.session_path is not None
         with self.session_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(message, ensure_ascii=False) + "\n")
         return message
 
     def get_messages(self) -> list[dict[str, Any]]:
+        """Assemble the request messages: system prompt plus recent history.
+
+        History beyond RECENT_MESSAGE_LIMIT is replaced by an LLM summary.
+        """
         messages = [{"role": "system", "content": self._system_prompt()}]
         history = self._messages
         if len(history) > RECENT_MESSAGE_LIMIT:
@@ -98,10 +109,15 @@ class ContextManager:
                     }
                 )
             history = history[-RECENT_MESSAGE_LIMIT:]
+            while history and history[0]["role"] == "tool":
+                # A tool result whose tool_call fell off the left edge is an
+                # orphan the API rejects.
+                history = history[1:]
         messages.extend(history)
         return messages
 
     def read_soul(self) -> str:
+        """The persona text from soul.md, or the builtin default."""
         if self.soul_path.is_file():
             text = self.soul_path.read_text(encoding="utf-8").strip()
             if text:
@@ -109,6 +125,7 @@ class ContextManager:
         return BUILTIN_SOUL
 
     def update_soul(self, text: str) -> None:
+        """Rewrite soul.md with ``text`` (no-op when blank)."""
         cleaned = text.strip()
         if not cleaned:
             return
@@ -120,6 +137,9 @@ class ContextManager:
             "你是 Nono，一个相信基座模型力量的小助手。\n"
             "下面是你的人格设定，请始终遵循。\n\n"
             f"{self.read_soul()}\n\n"
+            "你可以调用 bash 工具执行命令（查看目录、读取文件等）："
+            "只读命令会直接放行，写命令会先询问用户。"
+            "需要了解环境时就主动使用，不要假装执行过。\n"
             "用户若明确要求执行某个工作流，说明书会被注入上下文；"
             "不要主动去读工作流目录。\n"
             "若你认为人格需要更新（用户明确要求，或出现应长期记住的自我约束），"
@@ -128,6 +148,7 @@ class ContextManager:
         )
 
     def _ensure_summary(self, history: list[dict[str, Any]]) -> str | None:
+        """Summarize the overflow part of ``history``, caching by cutoff."""
         cutoff = len(history) - RECENT_MESSAGE_LIMIT
         if cutoff <= 0:
             return self._summary
