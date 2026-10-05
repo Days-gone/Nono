@@ -24,6 +24,7 @@ from rich.table import Table
 from rich.text import Text
 
 from src.apps.pet import NonoPet, REFRESH_INTERVAL
+from src.core.context import SessionInfo
 from src.core.nono import Nono, ToolUse
 
 console = Console()
@@ -43,7 +44,9 @@ class _Command:
 # Single source of truth for both the completion menu and what the REPL accepts.
 _COMMANDS: tuple[_Command, ...] = (
     _Command("/exit", "退出 Nono"),
-    _Command("/resume", "切换或新建会话"),
+    _Command("/new", "新建一个会话"),
+    _Command("/clear", "清空当前会话的历史"),
+    _Command("/resume", "切换、新建或删除会话"),
     _Command("/workflow", "列出或加载 .workflows/ 中的工作流"),
     _Command("/tools", "列出可用的工具"),
     _Command("/bash", "执行 bash 命令（写命令会先询问）"),
@@ -96,6 +99,17 @@ def main(argv: list[str] | None = None) -> int:
         if line == "/exit":
             console.print("[dim]再见。[/dim]")
             return 0
+        if line == "/new":
+            session = nono.create_session()
+            console.print(f"[dim]已新建会话：{session.name}[/dim]")
+            continue
+        if line == "/clear":
+            if Confirm.ask("清空当前会话历史？此操作不可撤销", default=False):
+                nono.clear_session()
+                console.print("[dim]已清空当前会话历史。[/dim]")
+            else:
+                console.print("[dim]已取消。[/dim]")
+            continue
         if line == "/resume":
             _resume(nono)
             continue
@@ -110,23 +124,25 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         printer = _ReplyPrinter(console, markdown=markdown)
+        stream = nono.reply_stream(line, ask=lambda cmd: _ask_while_streaming(printer, cmd))
         try:
             try:
-                for event in nono.reply_stream(line, ask=lambda cmd: _ask_while_streaming(printer, cmd)):
+                for event in stream:
                     if event.tool_use is not None:
                         _print_tool_use(event.tool_use)
                     if event.text:
                         printer.feed(event.text)
                     if event.done:
                         printer.close()
-                    if event.soul_updated:
-                        console.print("[yellow]已更新人格文件 configs/soul.md[/yellow]")
                 if pet is not None:
                     pet.cheer()
             finally:
+                # Closing explicitly (rather than waiting for GC) is what makes
+                # the rollback of an interrupted turn deterministic.
+                stream.close()
                 printer.close()
         except KeyboardInterrupt:
-            console.print("[dim]已中断本次回复。[/dim]")
+            console.print("[dim]已中断本次回复（本轮未写入历史）。[/dim]")
             continue
         except Exception as error:
             if pet is not None:
@@ -400,10 +416,13 @@ def _print_tool_use(use: ToolUse) -> None:
 def _tools(nono: Nono) -> None:
     table = Table(title="工具列表", show_lines=False)
     table.add_column("名称", style="white")
+    table.add_column("可用方式", style="cyan")
     table.add_column("说明", style="dim")
     for tool in nono.list_tools():
-        table.add_row(tool.name, tool.help)
+        how = "模型可调用" if tool.model_callable else "仅斜杠命令"
+        table.add_row(tool.name, how, tool.help)
     console.print(table)
+    console.print("[dim]模型只能主动调用「模型可调用」的工具；其余工具由你用斜杠命令触发。[/dim]")
 
 
 def _workflow(nono: Nono, name: str) -> None:
@@ -437,11 +456,16 @@ def _resume(nono: Nono) -> None:
         mark = "（当前）" if session.name == nono.context.session_name else ""
         table.add_row(str(index), f"{session.name}{mark}")
     console.print(table)
+    console.print("[dim]输入序号切换，输入 d<序号> 删除，输入 0 新建。[/dim]")
 
     choice = console.input("[bold cyan]选择序号 > [/bold cyan]").strip()
     if choice == "0":
         session = nono.create_session()
         console.print(f"[dim]已新建会话：{session.name}[/dim]")
+        return
+
+    if choice[:1] in ("d", "D"):
+        _delete_session(nono, sessions, choice[1:].strip())
         return
 
     if not choice.isdigit():
@@ -455,6 +479,28 @@ def _resume(nono: Nono) -> None:
 
     session = nono.resume_session(sessions[index - 1].name)
     console.print(f"[dim]已切换到会话：{session.name}[/dim]")
+
+
+def _delete_session(nono: Nono, sessions: list[SessionInfo], raw_index: str) -> None:
+    """Handle ``d<序号>`` from the resume prompt."""
+    if not raw_index.isdigit():
+        console.print("[red]删除用法：d<序号>，例如 d2。[/red]")
+        return
+    index = int(raw_index)
+    if index < 1 or index > len(sessions):
+        console.print("[red]无效序号。[/red]")
+        return
+    target = sessions[index - 1]
+    if target.name == nono.context.session_name:
+        console.print("[red]不能删除当前会话，请先切换到其他会话。[/red]")
+        return
+    if not Confirm.ask(f"删除会话 {target.name}？此操作不可撤销", default=False):
+        console.print("[dim]已取消。[/dim]")
+        return
+    if nono.delete_session(target.name):
+        console.print(f"[dim]已删除会话：{target.name}[/dim]")
+    else:
+        console.print("[red]删除失败，文件可能已不存在。[/red]")
 
 
 if __name__ == "__main__":

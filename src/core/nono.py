@@ -156,6 +156,14 @@ class Nono:
     def list_sessions(self) -> list[SessionInfo]:
         return self.context.list_sessions()
 
+    def clear_session(self) -> None:
+        """Forget the current session's history, keeping the session file."""
+        self.context.clear()
+
+    def delete_session(self, name: str) -> bool:
+        """Delete session ``name``; False when it isn't there."""
+        return self.context.delete(name)
+
     def list_tools(self) -> tuple[tools.ToolInfo, ...]:
         """The tools wired into Nono, as shown by the CLI's /tools command."""
         return tools.TOOLS
@@ -214,60 +222,72 @@ class Nono:
             yield NonoEvent(done=True)
             return
 
+        # Roll back everything this turn appends if it doesn't finish, so an
+        # interrupted or failed turn leaves no half-written transcript behind.
+        start = self.context.message_count()
         self.context.add_message("user", text)
         soul_updated = False
-        for _round in range(MAX_TOOL_ROUNDS):
-            soul_filter = SoulFilter()
-            parts: list[str] = []
-            tool_calls: list[dict[str, str]] = []
-            for chunk in self.llm.stream_turn(self.context.get_messages(), tools=_TOOL_SCHEMAS):
-                if chunk.text:
-                    visible = soul_filter.feed(chunk.text)
-                    if visible:
-                        parts.append(visible)
-                        yield NonoEvent(text=visible)
-                if chunk.tool_calls is not None:
-                    tool_calls = chunk.tool_calls
-            tail, soul = soul_filter.finalize()
-            if tail:
-                parts.append(tail)
-                yield NonoEvent(text=tail)
-            if soul and not soul_updated:
-                self.context.update_soul(soul)
-                soul_updated = True
-            visible_text = "".join(parts).strip()
+        done = False
+        try:
+            for _round in range(MAX_TOOL_ROUNDS):
+                soul_filter = SoulFilter()
+                parts: list[str] = []
+                tool_calls: list[dict[str, str]] = []
+                for chunk in self.llm.stream_turn(self.context.get_messages(), tools=_TOOL_SCHEMAS):
+                    if chunk.text:
+                        visible = soul_filter.feed(chunk.text)
+                        if visible:
+                            parts.append(visible)
+                            yield NonoEvent(text=visible)
+                    if chunk.tool_calls is not None:
+                        tool_calls = chunk.tool_calls
+                tail, soul = soul_filter.finalize()
+                if tail:
+                    parts.append(tail)
+                    yield NonoEvent(text=tail)
+                if soul and not soul_updated:
+                    self.context.update_soul(soul)
+                    soul_updated = True
+                visible_text = "".join(parts).strip()
 
-            if not tool_calls:
-                self.context.add_message("assistant", visible_text)
-                break
+                if not tool_calls:
+                    self.context.add_message("assistant", visible_text)
+                    break
 
-            self.context.add_message(
-                "assistant",
-                visible_text,
-                tool_calls=[
-                    {
-                        "id": call["id"],
-                        "type": "function",
-                        "function": {"name": call["name"], "arguments": call["arguments"]},
-                    }
-                    for call in tool_calls
-                ],
-            )
-            for call in tool_calls:
-                output, denied = self._run_tool(call, ask)
-                yield NonoEvent(
-                    tool_use=ToolUse(
-                        name=call["name"],
-                        arguments=call["arguments"],
-                        output=output,
-                        denied=denied,
-                    )
+                self.context.add_message(
+                    "assistant",
+                    visible_text,
+                    tool_calls=[
+                        {
+                            "id": call["id"],
+                            "type": "function",
+                            "function": {"name": call["name"], "arguments": call["arguments"]},
+                        }
+                        for call in tool_calls
+                    ],
                 )
-                self.context.add_message("tool", output, tool_call_id=call["id"])
-        else:
-            # The loop never broke: every round asked for more tools.
-            yield NonoEvent(text=f"\n（工具调用已达 {MAX_TOOL_ROUNDS} 轮上限，先到这里。）")
-        yield NonoEvent(soul_updated=soul_updated, done=True)
+                for call in tool_calls:
+                    output, denied = self._run_tool(call, ask)
+                    yield NonoEvent(
+                        tool_use=ToolUse(
+                            name=call["name"],
+                            arguments=call["arguments"],
+                            output=output,
+                            denied=denied,
+                        )
+                    )
+                    self.context.add_message("tool", output, tool_call_id=call["id"])
+            else:
+                # The loop never broke: every round asked for more tools.
+                yield NonoEvent(text=f"\n（工具调用已达 {MAX_TOOL_ROUNDS} 轮上限，先到这里。）")
+            done = True
+            yield NonoEvent(soul_updated=soul_updated, done=True)
+        except (Exception, KeyboardInterrupt, GeneratorExit):
+            # A turn that never reached its done event -- interrupted, failed,
+            # or abandoned by the consumer -- is rolled back whole.
+            if not done:
+                self.context.rollback(start)
+            raise
 
     def _run_tool(
         self,

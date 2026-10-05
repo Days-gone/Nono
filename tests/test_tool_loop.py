@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from src.core.context import ContextManager
 from src.core.llm import TurnChunk
 from src.core.nono import MAX_TOOL_ROUNDS, Nono
@@ -87,3 +89,74 @@ def test_plain_reply_without_tools_still_works(tmp_path, monkeypatch):
     nono = _nono(tmp_path, monkeypatch, llm)
     reply = nono.reply("打个招呼")
     assert reply.text == "你好呀"
+
+
+class InterruptLLM:
+    """Streams a little, then the user hits Ctrl-C."""
+
+    def stream_turn(self, messages, tools=None):
+        yield TurnChunk(text="说到一半")
+        raise KeyboardInterrupt
+
+    def chat(self, prompt) -> str:
+        return ""
+
+
+class BrokenLLM:
+    """The API call blows up before any reply."""
+
+    def stream_turn(self, messages, tools=None):
+        raise RuntimeError("网络挂了")
+        yield TurnChunk()  # pragma: no cover
+
+    def chat(self, prompt) -> str:
+        return ""
+
+
+def test_interrupted_turn_leaves_no_dangling_message(tmp_path, monkeypatch):
+    nono = _nono(tmp_path, monkeypatch, InterruptLLM())
+    with pytest.raises(KeyboardInterrupt):
+        list(nono.reply_stream("你好"))
+
+    assert nono.context.message_count() == 0
+    assert nono.context.session_path.read_text(encoding="utf-8") == ""
+
+
+def test_failed_turn_is_rolled_back(tmp_path, monkeypatch):
+    nono = _nono(tmp_path, monkeypatch, BrokenLLM())
+    with pytest.raises(RuntimeError):
+        list(nono.reply_stream("你好"))
+
+    assert nono.context.message_count() == 0
+
+
+def test_abandoned_turn_is_rolled_back(tmp_path, monkeypatch):
+    llm = StubLLM([[TurnChunk(text="第一段"), TurnChunk(text="第二段"), TurnChunk(tool_calls=[])]])
+    nono = _nono(tmp_path, monkeypatch, llm)
+    stream = nono.reply_stream("你好")
+    next(stream)  # the consumer walks away mid-stream
+    stream.close()
+
+    assert nono.context.message_count() == 0
+
+
+def test_soul_block_is_stripped_from_the_reply_and_written(tmp_path, monkeypatch):
+    llm = StubLLM([
+        [TurnChunk(text="好的"), TurnChunk(text="<soul>永远先给结论。</soul>"), TurnChunk(tool_calls=[])],
+    ])
+    nono = _nono(tmp_path, monkeypatch, llm)
+    reply = nono.reply("以后回答先给结论")
+
+    assert reply.text == "好的"  # the persona block never reaches the user
+    assert reply.soul_updated is True
+    assert (tmp_path / "s.md").read_text(encoding="utf-8").strip() == "永远先给结论。"
+
+
+def test_completed_turn_survives_close(tmp_path, monkeypatch):
+    llm = StubLLM([[TurnChunk(text="你好"), TurnChunk(tool_calls=[])]])
+    nono = _nono(tmp_path, monkeypatch, llm)
+    stream = nono.reply_stream("打个招呼")
+    list(stream)
+    stream.close()  # no-op: the generator is already exhausted
+
+    assert nono.context.message_count() == 2

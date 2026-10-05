@@ -16,6 +16,17 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _env_number(name: str, default: float, cast: type) -> float | int:
+    """Read a numeric env var, falling back to ``default`` when unset or bad."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return cast(default)
+    try:
+        return cast(raw)
+    except ValueError:
+        return cast(default)
+
+
 @dataclass(frozen=True)
 class TurnChunk:
     """One piece of a streamed assistant turn.
@@ -41,7 +52,14 @@ class LLM:
         assert self.baseurl is not None, "NONO_BASE_URL is not set"
         assert self.apikey is not None, "NONO_API_KEY is not set"
         assert self.model is not None, "NONO_MODEL is not set"
-        self.client = OpenAI(base_url=self.baseurl, api_key=self.apikey)
+        # The SDK handles transient network errors and 5xx itself; a request
+        # that stalls past the timeout fails the turn (which Nono rolls back).
+        self.client = OpenAI(
+            base_url=self.baseurl,
+            api_key=self.apikey,
+            timeout=_env_number("NONO_TIMEOUT", 60.0, float),
+            max_retries=_env_number("NONO_MAX_RETRIES", 2, int),
+        )
 
     def chat(self, prompt: str | list[str]) -> str:
         """One-shot helper: turn a prompt (or prompt parts) into a reply."""

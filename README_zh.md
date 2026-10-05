@@ -10,7 +10,7 @@
   LLM:主要包含了对不同API的封装使得 LLM provider 在这一层得到统一封装，目前只兼容openai API格式。
   Nono:主要负责对工具的迭代调用的逻辑进行处理，集成其他的模块如Tool，Workflow等。
 - Tool:
-  工具包, 负责为Nono提供一些能力，只单纯的提供某一个工具并做好, 目前提供 bash、update_soul 与 workflow（列出/加载）工具，后续的工具包视情况添加。
+  工具包, 负责为Nono提供一些能力，只单纯的提供某一个工具并做好, 目前提供 bash、update_soul 与 workflow（列出/加载）工具，后续的工具包视情况添加。其中只有 bash 会以 function calling 的形式声明给模型（模型可主动调用）；update_soul 与 workflow 不暴露给模型，只能由用户经斜杠命令或程序调用触发——`/tools` 会标注每个工具的可用方式。
 - Workflow: 
   工作流，当前运行目录的 `.workflows/<名称>/` 即一个工作流。其中 `workflow.md` 是说明书，加载时注入上下文；`scripts/` 存放该工作流的工具脚本（stdlib 优先、非交互、参数走命令行），不注入上下文，由模型经 bash 工具按需调用。由它们内部构成工作流以方便用户间快速的完成某个任务的传递。
 - ContextManager:
@@ -33,3 +33,12 @@ Nono 集成工具：update_soul 与 workflow 工具挂载为 Nono 的方法；�
 新增 bash 工具与 `/bash <命令>` 命令：只读命令（ls/cat/grep/git status 等白名单）直接放行，含重定向、命令替换、sudo 或白名单外命令的一律先询问许可；分类是保守的朴素解析，宁可多问。该工具依赖 PATH 上的 bash（Windows 下用 Git Bash），Windows 平台暂未覆盖其测试。
 Nono 支持工具调用循环：模型现在可以在回复中通过 function calling 调用 bash 工具（流式），写命令仍会先询问用户，工具结果写回上下文后继续对话，最多 8 轮；CLI 会展示每次工具调用及结果预览。至此"对工具的迭代调用"落地。
 新增首个工作流 `duanju`（AI 短剧创作），并确立工作流目录结构：`workflow.md` 为注入上下文的说明书（立项→剧本→角色设定→分镜→合成提示词→生成→ffmpeg 拼接），`scripts/` 为模型经 bash 调用的工具脚本（`init_project.py` 脚手架、`make_prompts.py` 角色设定+分镜合成逐镜头提示词、`concat.sh` 片段拼接）。
+
+2026.10.5
+明确工具边界：只有 bash 以 function calling 声明给模型，`/tools` 现在标注每个工具是「模型可调用」还是「仅斜杠命令」。
+人格更新改为完全静默：模型在回复里附带的 `<soul>...</soul>` 块被剥离并写盘，界面上不再有任何提示——人格可以在对话中不知不觉地演进。
+会话管理：新增 `/new`（新建会话）与 `/clear`（清空当前会话历史），`/resume` 支持 `d<序号>` 删除会话；同一秒内新建的会话不再重名。`/clear` 与删除会话都是不可逆操作，执行前会先确认（与 bash 写命令同一原则）。
+回复循环：被 Ctrl-C 中断或调用失败的这一轮会整体回滚，不再在历史里留下悬空的 user 消息或对不上 tool_calls 的 tool 结果。
+上下文摘要：摘要持久化到 `.history/*.summary.json`，长会话重启不再重复摘要；摘要调用失败时本轮退回最近历史继续，不中断回复。
+LLM 客户端支持 `NONO_TIMEOUT`（默认 60 秒）与 `NONO_MAX_RETRIES`（默认 2）。
+新增 `nono` 命令入口：`uv run nono`（等价于 `uv run python -m src.apps.cli`）。
